@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import csv
 import requests
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -8,7 +9,7 @@ from datetime import datetime
 import html
 import sys
 
-# ================= 設定區 =================
+# ================= 設定值 =================
 BURP_API_URL = "http://localhost:1337/v0.1"
 API_KEY = ""  # 若有設定請填入
 MAX_RETRIES = 5
@@ -23,7 +24,13 @@ total_tasks = 0
 lock = threading.Lock()
 stop_dashboard_flag = False
 CURRENT_SCAN_CONFIG = "Crawl and Audit - Fast"
-API_ONLINE = False  # [v10] 新增 API 狀態旗標
+API_ONLINE = False
+
+# [NEW] 日誌與時間記錄
+scan_logs = []  # 所有日誌記錄
+scan_time_records = {}  # 各站點時間記錄 {url: {start, end, duration}}
+session_start_time = None
+session_end_time = None
 
 class ANSI:
     CYAN, GREEN, YELLOW, RED, RESET, BOLD = '\033[96m', '\033[92m', '\033[93m', '\033[91m', '\033[0m', '\033[1m'
@@ -33,24 +40,36 @@ class ANSI:
 def clear_screen():
     os.system(ANSI.CLEAR)
 
-# --- 0. [v10] API 檢查與 KB 載入 ---
+# [NEW] 日誌記錄函數
+def log_event(level, message, url=None):
+    """記錄事件到日誌系統"""
+    timestamp = datetime.now().isoformat()
+    log_entry = {
+        "timestamp": timestamp,
+        "level": level,  # INFO, WARNING, ERROR, SUCCESS
+        "message": message,
+        "url": url
+    }
+    with lock:
+        scan_logs.append(log_entry)
+    
+    # 同時輸出到控制台(可選)
+    if level == "ERROR":
+        print(f"{ANSI.RED}[{level}] {message}{ANSI.RESET}")
+
+# --- 0. API 檢查與 KB 載入 ---
 def check_api_and_load_kb():
-    """
-    檢查 API 是否存活。若存活且 KB 尚未載入，則執行載入。
-    回傳: True (Online), False (Offline)
-    """
     global API_ONLINE, issue_definitions_map
     headers = {}
     if API_KEY: headers["X-Burp-API-Key"] = API_KEY
     
     try:
-        # 嘗試輕量級請求確認存活
         requests.get(f"{BURP_API_URL.replace('/v0.1','')}/api-definition", headers=headers, timeout=2)
         API_ONLINE = True
+        log_event("INFO", "Burp API 連線成功")
         
-        # 如果 API 在線，但知識庫還是空的，就嘗試載入
         if not issue_definitions_map:
-            print(f"\n{ANSI.CYAN}[*] 偵測到 Burp 上線，正在載入知識庫...{ANSI.RESET}")
+            print(f"\n{ANSI.CYAN}[*] 偵測到 Burp 上線,正在載入知識庫...{ANSI.RESET}")
             try:
                 resp = requests.get(f"{BURP_API_URL}/knowledge_base/issue_definitions", headers=headers, timeout=10)
                 if resp.status_code == 200:
@@ -61,14 +80,16 @@ def check_api_and_load_kb():
                                 issue_definitions_map[int(d.get("issue_type_id"), 16)] = d
                         except: pass
                     print(f"{ANSI.GREEN}[+] 知識庫載入完成 (共 {len(issue_definitions_map)} 筆){ANSI.RESET}")
-                    time.sleep(1.5) # 讓使用者看到成功訊息
+                    log_event("SUCCESS", f"知識庫載入完成: {len(issue_definitions_map)} 筆定義")
+                    time.sleep(1.5)
                 else:
-                    print(f"{ANSI.RED}[!] 載入失敗: HTTP {resp.status_code}{ANSI.RESET}")
+                    log_event("ERROR", f"知識庫載入失敗: HTTP {resp.status_code}")
             except Exception as e:
-                print(f"{ANSI.RED}[!] 載入錯誤: {e}{ANSI.RESET}")
+                log_event("ERROR", f"知識庫載入錯誤: {e}")
         return True
     except:
         API_ONLINE = False
+        log_event("WARNING", "Burp API 離線")
         return False
 
 # --- 1. 合併資料邏輯 ---
@@ -93,25 +114,41 @@ def select_scan_config():
     choice = input(f"請輸入選項 (預設 1 - Fast): ").strip()
     try: idx = int(choice) - 1; CURRENT_SCAN_CONFIG = configs[idx] if 0 <= idx < len(configs) else configs[0]
     except: CURRENT_SCAN_CONFIG = configs[0]
-    print(f"{ANSI.GREEN}已設定策略為: {CURRENT_SCAN_CONFIG}{ANSI.RESET}\n"); time.sleep(1)
+    print(f"{ANSI.GREEN}已設定策略為: {CURRENT_SCAN_CONFIG}{ANSI.RESET}\n")
+    log_event("INFO", f"掃描策略設定: {CURRENT_SCAN_CONFIG}")
+    time.sleep(1)
 
-# --- 3. 報告生成器 ---
-def generate_reports(url, issues, output_dir, scan_config, task_id="-"):
+# --- 3. 報告生成器 (增強版) ---
+def generate_reports(url, issues, output_dir, scan_config, task_id="-", start_time=None, end_time=None):
     timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
     safe_name = url.replace("http://", "").replace("https://", "").replace(":", "_").replace("/", "_")
     enriched_issues = [merge_issue_data(i) for i in issues]
     
+    # 計算掃描時長
+    duration_seconds = None
+    if start_time and end_time:
+        duration_seconds = (end_time - start_time).total_seconds()
+    
     # JSON
     json_filename = os.path.join(output_dir, f"{timestamp_str}_Data_{safe_name}.json")
     try:
+        json_data = {
+            "target_url": url,
+            "scan_configuration": scan_config,
+            "task_id": task_id,
+            "scan_start_time": start_time.isoformat() if start_time else None,
+            "scan_end_time": end_time.isoformat() if end_time else None,
+            "scan_duration_seconds": duration_seconds,
+            "generated_at": datetime.now().isoformat(),
+            "issue_count": len(enriched_issues),
+            "issues": enriched_issues
+        }
         with open(json_filename, "w", encoding="utf-8") as f:
-            json.dump({
-                "target_url": url, "scan_configuration": scan_config, "task_id": task_id,
-                "generated_at": datetime.now().isoformat(), "issue_count": len(enriched_issues), "issues": enriched_issues
-            }, f, ensure_ascii=False, indent=4)
-    except Exception as e: print(f"JSON Error: {e}")
+            json.dump(json_data, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        log_event("ERROR", f"JSON 生成錯誤: {e}", url)
 
-    # HTML
+    # HTML (增強版 - 加入時間資訊)
     def normalize_severity(raw_sev):
         s = str(raw_sev).lower() if raw_sev else ""
         if "high" in s: return "High"
@@ -135,6 +172,7 @@ def generate_reports(url, issues, output_dir, scan_config, task_id="-"):
     .container { max-width: 1000px; margin: 0 auto; background: #fff; padding: 30px; border-radius: 5px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
     h1 { border-bottom: 2px solid #e04006; padding-bottom: 10px; color: #e04006; }
     .meta { background: #eee; padding: 10px; margin-bottom: 20px; border-radius: 4px; }
+    .time-info { background: #d4edda; padding: 10px; margin-bottom: 20px; border-radius: 4px; border-left: 4px solid #28a745; }
     .summary-box { display: flex; gap: 10px; margin-bottom: 30px; }
     .stat-card { flex: 1; padding: 15px; text-align: center; color: #fff; border-radius: 4px; font-weight: bold; }
     .High { background: #ff3333; } .Medium { background: #ff9933; } .Low { background: #3399ff; } .Information { background: #808080; }
@@ -146,9 +184,23 @@ def generate_reports(url, issues, output_dir, scan_config, task_id="-"):
     .section-title { font-size: 1.1em; font-weight: bold; margin-top: 20px; margin-bottom: 10px; color: #e04006; border-left: 4px solid #e04006; padding-left: 8px; }
     .bg-section { color: #555; font-size: 0.95em; }
     """
+    
+    # 時間資訊區塊
+    time_info_html = ""
+    if start_time and end_time:
+        time_info_html = f"""
+        <div class="time-info">
+            <strong>🕒 掃描時間資訊:</strong><br>
+            開始時間: {start_time.strftime('%Y-%m-%d %H:%M:%S')}<br>
+            結束時間: {end_time.strftime('%Y-%m-%d %H:%M:%S')}<br>
+            掃描時長: {int(duration_seconds // 60)} 分 {int(duration_seconds % 60)} 秒
+        </div>
+        """
+    
     html_content = f"""<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Report: {url}</title><style>{css}</style></head><body>
     <div class="container"><h1>Burp Scan Report</h1>
-    <div class="meta"><strong>Target:</strong> {url}<br><strong>Config:</strong> {scan_config}<br><strong>ID:</strong> {task_id}<br><strong>Date:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
+    <div class="meta"><strong>Target:</strong> {url}<br><strong>Config:</strong> {scan_config}<br><strong>ID:</strong> {task_id}<br><strong>Generated:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
+    {time_info_html}
     <div class="summary-box"><div class="stat-card High">High: {severity_counts['High']}</div><div class="stat-card Medium">Medium: {severity_counts['Medium']}</div><div class="stat-card Low">Low: {severity_counts['Low']}</div><div class="stat-card Information">Info: {severity_counts['Information']}</div></div>
     <h2>Issue Details</h2>"""
 
@@ -168,7 +220,8 @@ def generate_reports(url, issues, output_dir, scan_config, task_id="-"):
     
     html_content += "</div></body></html>"
     with open(html_filename, "w", encoding="utf-8") as f: f.write(html_content)
-    return {}, html_filename
+    
+    return {"url": url, "issues": len(enriched_issues), "severity_counts": severity_counts}, html_filename
 
 # --- 4. 匯出 UI ---
 def export_existing_tasks_ui(report_dir):
@@ -191,16 +244,27 @@ def export_existing_tasks_ui(report_dir):
                 if issues:
                     _, html_path = generate_reports(origin, issues, report_dir, "Existing", t_id)
                     print(f"{t_id:<5} | {ANSI.GREEN}{data.get('scan_status','?')[:15]:<15}{ANSI.RESET} | {os.path.basename(html_path)}")
+                    log_event("SUCCESS", f"匯出任務 {t_id} 成功", origin)
                 else: print(f"{t_id:<5} | {data.get('scan_status','?'):<15} | {ANSI.YELLOW}無漏洞/未完成{ANSI.RESET}")
             else: print(f"{t_id:<5} | {ANSI.RED}Not Found{ANSI.RESET}     | HTTP {r.status_code}")
-        except Exception as e: print(f"{t_id:<5} | {ANSI.RED}Error{ANSI.RESET}         | {e}")
+        except Exception as e:
+            print(f"{t_id:<5} | {ANSI.RED}Error{ANSI.RESET}         | {e}")
+            log_event("ERROR", f"匯出任務 {t_id} 失敗: {e}")
     print("-" * 75); input("\n按 Enter 回選單...")
 
-# --- 5. 掃描核心 ---
+# --- 5. 掃描核心 (增強版 - 記錄時間) ---
 def run_scan_task(url, report_dir):
-    global completed_tasks
+    global completed_tasks, scan_time_records
     url = url.strip()
-    with lock: scan_states[url].update({"status": "Starting", "task_id": "Init"})
+    
+    # 記錄開始時間
+    start_time = datetime.now()
+    with lock:
+        scan_states[url].update({"status": "Starting", "task_id": "Init"})
+        scan_time_records[url] = {"start": start_time, "end": None, "duration": None}
+    
+    log_event("INFO", f"開始掃描", url)
+    
     headers = {} if not API_KEY else {"X-Burp-API-Key": API_KEY}
     
     try:
@@ -209,11 +273,16 @@ def run_scan_task(url, report_dir):
         if resp.status_code == 201:
             task_id = resp.headers.get("Location").split("/")[-1]
             with lock: scan_states[url].update({"task_id": task_id, "status": "Wait 3s..."})
+            log_event("SUCCESS", f"任務 {task_id} 建立成功", url)
             time.sleep(3)
         else:
-            with lock: scan_states[url]["status"] = f"Err {resp.status_code}"; completed_tasks += 1; return
-    except:
-        with lock: scan_states[url]["status"] = "Conn Fail"; completed_tasks += 1; return
+            with lock: scan_states[url]["status"] = f"Err {resp.status_code}"; completed_tasks += 1
+            log_event("ERROR", f"任務建立失敗: HTTP {resp.status_code}", url)
+            return
+    except Exception as e:
+        with lock: scan_states[url]["status"] = "Conn Fail"; completed_tasks += 1
+        log_event("ERROR", f"連線失敗: {e}", url)
+        return
 
     task_id = scan_states[url]["task_id"]
     final_data = {}
@@ -231,24 +300,38 @@ def run_scan_task(url, report_dir):
                 with lock: scan_states[url].update({"status": status, "reqs": reqs, "issues": issue_count})
                 if status in ["succeeded", "failed"]: break
             time.sleep(2)
-        except:
-            with lock: scan_states[url]["status"] = "Burp Lost"; break
+        except Exception as e:
+            with lock: scan_states[url]["status"] = "Burp Lost"
+            log_event("ERROR", f"掃描過程中斷: {e}", url)
+            break
+
+    # 記錄結束時間
+    end_time = datetime.now()
+    duration = (end_time - start_time).total_seconds()
+    with lock:
+        scan_time_records[url]["end"] = end_time
+        scan_time_records[url]["duration"] = duration
 
     if scan_states[url]["status"] != "Burp Lost" and final_data:
         with lock: scan_states[url]["status"] = "Reporting"
         issues = [e.get("issue") for e in final_data.get("issue_events", []) if e.get("type") == "issue_found"]
-        report_data, _ = generate_reports(url, issues, report_dir, CURRENT_SCAN_CONFIG, task_id)
-        with lock: all_session_results.append(report_data); scan_states[url]["status"] = "Completed"
+        report_data, _ = generate_reports(url, issues, report_dir, CURRENT_SCAN_CONFIG, task_id, start_time, end_time)
+        with lock:
+            all_session_results.append(report_data)
+            scan_states[url]["status"] = "Completed"
+        log_event("SUCCESS", f"掃描完成 - 發現 {len(issues)} 個問題,耗時 {int(duration)}秒", url)
     else:
         if scan_states[url]["status"] != "Burp Lost":
             with lock: scan_states[url]["status"] = "Failed"
+        log_event("ERROR", "掃描失敗", url)
+    
     with lock: completed_tasks += 1
 
 # --- 6. Dashboard ---
 def dashboard_loop():
     while not stop_dashboard_flag:
         clear_screen()
-        print(f"{ANSI.BOLD}Burp Suite Pro 自動化掃描 v10.0 (Auto-Detect){ANSI.RESET}")
+        print(f"{ANSI.BOLD}Burp Suite Pro 自動化掃描 v11.0 (Enhanced Logging){ANSI.RESET}")
         print(f"進度: {completed_tasks}/{total_tasks} | 策略: {CURRENT_SCAN_CONFIG}")
         print("-" * 90)
         print(f"{'URL':<35} | {'ID':<5} | {'Status':<15} | {'Reqs':<6} | {'Issues':<6}")
@@ -264,18 +347,127 @@ def dashboard_loop():
         print("-" * 90)
         time.sleep(1)
 
-# --- 7. 主程式 (v10 改良版) ---
+# --- 7. [NEW] 匯出日誌與統計報告 ---
+def export_logs_and_statistics(report_dir):
+    """匯出完整日誌和統計資料"""
+    timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+    
+    # 1. 匯出 JSON 日誌
+    log_json_path = os.path.join(report_dir, f"{timestamp_str}_Scan_Logs.json")
+    try:
+        with open(log_json_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "session_start": session_start_time.isoformat() if session_start_time else None,
+                "session_end": session_end_time.isoformat() if session_end_time else None,
+                "total_events": len(scan_logs),
+                "logs": scan_logs
+            }, f, ensure_ascii=False, indent=4)
+        print(f"{ANSI.GREEN}[+] 日誌已匯出: {log_json_path}{ANSI.RESET}")
+    except Exception as e:
+        print(f"{ANSI.RED}[!] 日誌匯出失敗: {e}{ANSI.RESET}")
+    
+    # 2. 匯出 CSV 統計報告
+    csv_path = os.path.join(report_dir, f"{timestamp_str}_Scan_Statistics.csv")
+    try:
+        with open(csv_path, "w", newline='', encoding="utf-8-sig") as csvfile:
+            fieldnames = ['URL', 'Task_ID', 'Status', 'Start_Time', 'End_Time', 'Duration_Sec', 
+                         'High', 'Medium', 'Low', 'Information', 'Total_Issues']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            with lock:
+                for url, state in scan_states.items():
+                    time_record = scan_time_records.get(url, {})
+                    
+                    # 從 all_session_results 找到對應的統計
+                    severity_data = {"High": 0, "Medium": 0, "Low": 0, "Information": 0}
+                    total_issues = 0
+                    for result in all_session_results:
+                        if result.get("url") == url:
+                            severity_data = result.get("severity_counts", severity_data)
+                            total_issues = result.get("issues", 0)
+                            break
+                    
+                    writer.writerow({
+                        'URL': url,
+                        'Task_ID': state.get('task_id', '-'),
+                        'Status': state.get('status', 'Unknown'),
+                        'Start_Time': time_record.get('start').strftime('%Y-%m-%d %H:%M:%S') if time_record.get('start') else '',
+                        'End_Time': time_record.get('end').strftime('%Y-%m-%d %H:%M:%S') if time_record.get('end') else '',
+                        'Duration_Sec': int(time_record.get('duration', 0)) if time_record.get('duration') else 0,
+                        'High': severity_data.get('High', 0),
+                        'Medium': severity_data.get('Medium', 0),
+                        'Low': severity_data.get('Low', 0),
+                        'Information': severity_data.get('Information', 0),
+                        'Total_Issues': total_issues
+                    })
+        print(f"{ANSI.GREEN}[+] 統計報告已匯出: {csv_path}{ANSI.RESET}")
+    except Exception as e:
+        print(f"{ANSI.RED}[!] CSV 匯出失敗: {e}{ANSI.RESET}")
+    
+    # 3. 匯出總覽 JSON
+    summary_path = os.path.join(report_dir, f"{timestamp_str}_Session_Summary.json")
+    try:
+        total_duration = (session_end_time - session_start_time).total_seconds() if session_start_time and session_end_time else 0
+        
+        summary_data = {
+            "session_info": {
+                "start_time": session_start_time.isoformat() if session_start_time else None,
+                "end_time": session_end_time.isoformat() if session_end_time else None,
+                "total_duration_seconds": total_duration,
+                "scan_configuration": CURRENT_SCAN_CONFIG,
+                "total_targets": total_tasks,
+                "completed_targets": completed_tasks
+            },
+            "aggregate_statistics": {
+                "total_high": sum(r.get("severity_counts", {}).get("High", 0) for r in all_session_results),
+                "total_medium": sum(r.get("severity_counts", {}).get("Medium", 0) for r in all_session_results),
+                "total_low": sum(r.get("severity_counts", {}).get("Low", 0) for r in all_session_results),
+                "total_information": sum(r.get("severity_counts", {}).get("Information", 0) for r in all_session_results),
+                "total_issues": sum(r.get("issues", 0) for r in all_session_results)
+            },
+            "scan_details": []
+        }
+        
+        for url, state in scan_states.items():
+            time_record = scan_time_records.get(url, {})
+            severity_data = {"High": 0, "Medium": 0, "Low": 0, "Information": 0}
+            total_issues = 0
+            
+            for result in all_session_results:
+                if result.get("url") == url:
+                    severity_data = result.get("severity_counts", severity_data)
+                    total_issues = result.get("issues", 0)
+                    break
+            
+            summary_data["scan_details"].append({
+                "url": url,
+                "task_id": state.get('task_id', '-'),
+                "status": state.get('status', 'Unknown'),
+                "start_time": time_record.get('start').isoformat() if time_record.get('start') else None,
+                "end_time": time_record.get('end').isoformat() if time_record.get('end') else None,
+                "duration_seconds": time_record.get('duration', 0),
+                "severity_counts": severity_data,
+                "total_issues": total_issues
+            })
+        
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary_data, f, ensure_ascii=False, indent=4)
+        print(f"{ANSI.GREEN}[+] 會話總覽已匯出: {summary_path}{ANSI.RESET}")
+    except Exception as e:
+        print(f"{ANSI.RED}[!] 總覽匯出失敗: {e}{ANSI.RESET}")
+
+# --- 8. 主程式 ---
 def main():
     global total_tasks, completed_tasks, scan_states, stop_dashboard_flag, all_session_results
+    global session_start_time, session_end_time, scan_logs, scan_time_records
     
-    # 迴圈監控 API 狀態，直到使用者按 q 離開
     while True:
-        check_api_and_load_kb() # 每次回到選單前都檢查一次狀態
+        check_api_and_load_kb()
         
         clear_screen()
-        print(f"{ANSI.BOLD}=== Burp Suite 自動化檢測工具 v10.0 ==={ANSI.RESET}")
+        print(f"{ANSI.BOLD}=== Burp Suite 自動化檢測工具 v11.0 (Enhanced) ==={ANSI.RESET}")
         
-        # 狀態顯示與選單動態生成
         if API_ONLINE:
             print(f"API 狀態: {ANSI.GREEN}Online{ANSI.RESET}")
             kb_status = f"{ANSI.GREEN}已載入 ({len(issue_definitions_map)}){ANSI.RESET}" if issue_definitions_map else f"{ANSI.YELLOW}載入中...{ANSI.RESET}"
@@ -290,25 +482,16 @@ def main():
             print(f"API 狀態: {ANSI.RED}Offline (等待 Burp 連線中...){ANSI.RESET}")
             print(f"知識庫: {ANSI.GREY}等待連線{ANSI.RESET}")
             print("-" * 40)
-            # 只有在 Offline 時才顯示這個動態提示
             print(f"{ANSI.YELLOW}[!] Burp 未啟動。程式將每 5 秒自動重試連線...{ANSI.RESET}")
             print("q. 離開程式 (Quit)")
             print("-" * 40)
             prompt = "請輸入選項 (或按 Enter 重新檢查): "
 
-        # 使用 input 配合 timeout 機制 (但在 Python input 是 blocking 的)
-        # 所以我們用一個簡單的 trick: 如果 offline，我們允許使用者輸入 q，
-        # 否則我們就 sleep 一下然後 continue 來模擬「定期檢查」
-        
-        # 這裡為了良好的 UX，我們不使用複雜的非同步 input，
-        # 而是讓使用者手動按 Enter 刷新，或者如果 Online 就正常操作。
-        
         try:
-            # 這裡我們做一個改良：如果 Offline，我們自動倒數刷新
             if not API_ONLINE:
                 print(f"{ANSI.CYAN}正在嘗試連線至 {BURP_API_URL}... (按 Ctrl+C 強制離開){ANSI.RESET}")
-                time.sleep(3) # 等待 3 秒再刷新
-                continue      # 跳回 while 開頭重新 check_api
+                time.sleep(3)
+                continue
                 
             choice = input(prompt).strip().lower()
         except KeyboardInterrupt:
@@ -317,23 +500,32 @@ def main():
         if choice in ['q', 'quit']:
             print("Bye!"); break
 
-        # 如果還沒 Online 但使用者亂按 (除了 q)
         if not API_ONLINE:
-            continue 
+            continue
 
-        # --- 以下是 Online 才會執行的邏輯 ---
         report_dir = "reports"
         if not os.path.exists(report_dir): os.makedirs(report_dir)
 
         if choice == '2':
             export_existing_tasks_ui(report_dir)
         elif choice == '1':
+            # 重置所有狀態
             with lock:
-                scan_states = {}; all_session_results = []
-                completed_tasks = 0; total_tasks = 0; stop_dashboard_flag = False
+                scan_states = {}
+                all_session_results = []
+                completed_tasks = 0
+                total_tasks = 0
+                stop_dashboard_flag = False
+                scan_logs = []
+                scan_time_records = {}
+                session_start_time = None
+                session_end_time = None
             
             url_file = input("網址清單 (預設 urls.txt): ").strip() or "urls.txt"
-            if not os.path.exists(url_file): print(f"{ANSI.RED}找不到檔案!{ANSI.RESET}"); time.sleep(1); continue
+            if not os.path.exists(url_file):
+                print(f"{ANSI.RED}找不到檔案!{ANSI.RESET}")
+                time.sleep(1)
+                continue
             
             select_scan_config()
             try: workers = int(input("並行數 (預設 2): ").strip() or "2")
@@ -341,10 +533,17 @@ def main():
             
             with open(url_file, "r") as f:
                 raw_urls = [line.strip() for line in f if line.strip()]
-                urls = list(dict.fromkeys(raw_urls)) # 去重且保持順序
+                urls = list(dict.fromkeys(raw_urls))
             
             total_tasks = len(urls)
-            if total_tasks == 0: print("清單是空的。"); time.sleep(1); continue
+            if total_tasks == 0:
+                print("清單是空的。")
+                time.sleep(1)
+                continue
+            
+            # 記錄會話開始時間
+            session_start_time = datetime.now()
+            log_event("INFO", f"掃描會話開始 - 共 {total_tasks} 個目標")
             
             with lock:
                 for u in urls: scan_states[u] = {"status": "Waiting", "reqs": 0, "issues": 0, "task_id": "-"}
@@ -354,15 +553,26 @@ def main():
             
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 for url in urls:
-                    time.sleep(0.5); executor.submit(run_scan_task, url, report_dir)
+                    time.sleep(0.5)
+                    executor.submit(run_scan_task, url, report_dir)
             
             while completed_tasks < total_tasks: time.sleep(1)
-            stop_dashboard_flag = True; ui_thread.join(); 
+            stop_dashboard_flag = True
+            ui_thread.join()
             
-            # 最後顯示一次完整的 Dashboard
+            # 記錄會話結束時間
+            session_end_time = datetime.now()
+            log_event("INFO", f"掃描會話結束 - 完成 {completed_tasks}/{total_tasks} 個目標")
+            
+            # 最後顯示完整 Dashboard
             clear_screen()
-            print(f"{ANSI.BOLD}Burp Suite Pro 自動化掃描 v10.0 (Completed){ANSI.RESET}")
+            print(f"{ANSI.BOLD}Burp Suite Pro 自動化掃描 v11.0 (Completed){ANSI.RESET}")
             print(f"進度: {completed_tasks}/{total_tasks} | 策略: {CURRENT_SCAN_CONFIG}")
+            
+            if session_start_time and session_end_time:
+                total_duration = (session_end_time - session_start_time).total_seconds()
+                print(f"會話時間: {session_start_time.strftime('%H:%M:%S')} - {session_end_time.strftime('%H:%M:%S')} (共 {int(total_duration//60)}分{int(total_duration%60)}秒)")
+            
             print("-" * 90)
             print(f"{'URL':<35} | {'ID':<5} | {'Status':<15} | {'Reqs':<6} | {'Issues':<6}")
             print("-" * 90)
@@ -372,16 +582,14 @@ def main():
                     print(f"{(url[:32] + '..') if len(url) > 32 else url:<35} | {s.get('task_id','-'):<5} | {color}{s['status']:<15}{ANSI.RESET} | {s['reqs']:<6} | {ANSI.RED}{s['issues']:<6}{ANSI.RESET}")
             print("-" * 90)
 
-            if all_session_results:
-                g_path = os.path.join(report_dir, f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_Global_Scan_Summary.json")
-                try:
-                    with open(g_path, "w", encoding="utf-8") as f:
-                        json.dump({"session_date": datetime.now().isoformat(), "total_targets": total_tasks, "results": all_session_results}, f, ensure_ascii=False, indent=4)
-                    print(f"\n{ANSI.GREEN}[+] 全域報告: {g_path}{ANSI.RESET}")
-                except: pass
+            # 匯出日誌與統計
+            print(f"\n{ANSI.CYAN}正在匯出日誌與統計報告...{ANSI.RESET}")
+            export_logs_and_statistics(report_dir)
+            
             input(f"\n{ANSI.CYAN}按 Enter 回主選單...{ANSI.RESET}")
         else:
-            print("無效選項。"); time.sleep(0.5)
+            print("無效選項。")
+            time.sleep(0.5)
 
 if __name__ == "__main__":
     main()
