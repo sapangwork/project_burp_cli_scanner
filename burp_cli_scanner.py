@@ -316,6 +316,10 @@ def run_scan_task(url, report_dir):
         with lock: scan_states[url]["status"] = "Reporting"
         issues = [e.get("issue") for e in final_data.get("issue_events", []) if e.get("type") == "issue_found"]
         report_data, _ = generate_reports(url, issues, report_dir, CURRENT_SCAN_CONFIG, task_id, start_time, end_time)
+        
+        # 將完整的漏洞資料也加入 report_data
+        report_data['full_issues'] = [merge_issue_data(i) for i in issues]
+        
         with lock:
             all_session_results.append(report_data)
             scan_states[url]["status"] = "Completed"
@@ -405,10 +409,41 @@ def export_logs_and_statistics(report_dir):
     except Exception as e:
         print(f"{ANSI.RED}[!] CSV 匯出失敗: {e}{ANSI.RESET}")
     
-    # 3. 匯出總覽 JSON
+    # 3. 匯出增強版總覽 JSON (包含完整漏洞細節)
     summary_path = os.path.join(report_dir, f"{timestamp_str}_Session_Summary.json")
     try:
         total_duration = (session_end_time - session_start_time).total_seconds() if session_start_time and session_end_time else 0
+        
+        # 收集所有站點的詳細資料
+        detailed_scans = []
+        
+        with lock:
+            for url, state in scan_states.items():
+                time_record = scan_time_records.get(url, {})
+                
+                # 從 all_session_results 找到對應的完整資料
+                severity_counts = {"High": 0, "Medium": 0, "Low": 0, "Information": 0}
+                full_issues = []
+                
+                for result in all_session_results:
+                    if result.get("url") == url:
+                        severity_counts = result.get("severity_counts", severity_counts)
+                        full_issues = result.get("full_issues", [])  # 完整漏洞資料
+                        break
+                
+                scan_detail = {
+                    "url": url,
+                    "task_id": state.get('task_id', '-'),
+                    "status": state.get('status', 'Unknown'),
+                    "start_time": time_record.get('start').isoformat() if time_record.get('start') else None,
+                    "end_time": time_record.get('end').isoformat() if time_record.get('end') else None,
+                    "duration_seconds": time_record.get('duration', 0),
+                    "severity_counts": severity_counts,
+                    "total_issues": len(full_issues),
+                    "issues": full_issues  # 完整漏洞細節
+                }
+                
+                detailed_scans.append(scan_detail)
         
         summary_data = {
             "session_info": {
@@ -420,40 +455,18 @@ def export_logs_and_statistics(report_dir):
                 "completed_targets": completed_tasks
             },
             "aggregate_statistics": {
-                "total_high": sum(r.get("severity_counts", {}).get("High", 0) for r in all_session_results),
-                "total_medium": sum(r.get("severity_counts", {}).get("Medium", 0) for r in all_session_results),
-                "total_low": sum(r.get("severity_counts", {}).get("Low", 0) for r in all_session_results),
-                "total_information": sum(r.get("severity_counts", {}).get("Information", 0) for r in all_session_results),
-                "total_issues": sum(r.get("issues", 0) for r in all_session_results)
+                "total_high": sum(s.get("severity_counts", {}).get("High", 0) for s in detailed_scans),
+                "total_medium": sum(s.get("severity_counts", {}).get("Medium", 0) for s in detailed_scans),
+                "total_low": sum(s.get("severity_counts", {}).get("Low", 0) for s in detailed_scans),
+                "total_information": sum(s.get("severity_counts", {}).get("Information", 0) for s in detailed_scans),
+                "total_issues": sum(s.get("total_issues", 0) for s in detailed_scans)
             },
-            "scan_details": []
+            "scan_details": detailed_scans  # 包含每個站點的完整漏洞資料
         }
-        
-        for url, state in scan_states.items():
-            time_record = scan_time_records.get(url, {})
-            severity_data = {"High": 0, "Medium": 0, "Low": 0, "Information": 0}
-            total_issues = 0
-            
-            for result in all_session_results:
-                if result.get("url") == url:
-                    severity_data = result.get("severity_counts", severity_data)
-                    total_issues = result.get("issues", 0)
-                    break
-            
-            summary_data["scan_details"].append({
-                "url": url,
-                "task_id": state.get('task_id', '-'),
-                "status": state.get('status', 'Unknown'),
-                "start_time": time_record.get('start').isoformat() if time_record.get('start') else None,
-                "end_time": time_record.get('end').isoformat() if time_record.get('end') else None,
-                "duration_seconds": time_record.get('duration', 0),
-                "severity_counts": severity_data,
-                "total_issues": total_issues
-            })
         
         with open(summary_path, "w", encoding="utf-8") as f:
             json.dump(summary_data, f, ensure_ascii=False, indent=4)
-        print(f"{ANSI.GREEN}[+] 會話總覽已匯出: {summary_path}{ANSI.RESET}")
+        print(f"{ANSI.GREEN}[+] 會話總覽已匯出 (含完整漏洞細節): {summary_path}{ANSI.RESET}")
     except Exception as e:
         print(f"{ANSI.RED}[!] 總覽匯出失敗: {e}{ANSI.RESET}")
 
